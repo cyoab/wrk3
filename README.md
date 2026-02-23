@@ -21,6 +21,7 @@ Constant-throughput load generation with accurate high-percentile latency measur
 - **HTTP/1.1** — keep-alive, chunked transfer encoding, custom headers
 - **Zero dependencies** — pure Zig + stdlib, no C libraries, no vendored code
 - **wrk2-compatible output** — drop-in replacement for existing tooling and scripts
+- **Histogram export** — CSV and JSON export of latency data for post-processing and visualization
 
 ## 📦 Installation
 
@@ -65,6 +66,7 @@ wrk3 [options] <url>
 | `-H, --header <H>` | — | Custom header, repeatable (`"Name: Value"`) |
 | `-L, --latency` | off | Print full latency percentile distribution |
 | `--timeout <T>` | `2s` | Socket timeout |
+| `--export <F:P>` | — | Export histogram (`csv:file.csv` or `json:file.json`) |
 
 ### Examples
 
@@ -80,6 +82,10 @@ wrk3 -R 500 -c 50 -L \
   -H "Authorization: Bearer mytoken" \
   -H "Accept: application/json" \
   https://api.example.com/endpoint
+
+# Export latency histogram to CSV or JSON
+wrk3 -R 1000 -d 30s --export csv:latency.csv http://localhost:8080
+wrk3 -R 1000 -d 30s --export json:latency.json http://localhost:8080
 ```
 
 ### Sample output
@@ -116,6 +122,7 @@ main.zig ─── CLI entry point
   │    │    ├── Scheduler   Constant-rate request pacer
   │    │    └── Histogram   Per-connection latency recording
   │    └── Timer        Duration tracking
+  ├── Export        CSV/JSON histogram export
   └── Stats         Aggregate & report results
 ```
 
@@ -130,6 +137,7 @@ main.zig ─── CLI entry point
 | `Worker` | Thread lifecycle, connection distribution, result collection |
 | `Stats` | Histogram merging, percentile computation, formatted output |
 | `Config` | Argument parsing, URL decomposition |
+| `Export` | CSV and JSON histogram export via `--export` flag |
 | `Units` | Human-readable duration/count/byte formatting and parsing |
 
 ## 🔬 Coordinated Omission
@@ -152,6 +160,7 @@ wrk3 aims to be a modern, dependency-free alternative to wrk2. Here's where thin
 - Latency percentile distribution (`-L`)
 - HTTP/1.1 keep-alive and chunked encoding
 - wrk2-compatible output format
+- CSV/JSON histogram export (`--export`)
 
 ### 🚧 Missing (not yet implemented)
 
@@ -164,7 +173,7 @@ wrk3 aims to be a modern, dependency-free alternative to wrk2. Here's where thin
 | **Thread calibration output** | ✅ | ❌ | wrk2 prints per-thread calibration stats (mean latency, sampling interval) |
 | **HTTP pipelining** | ✅ | ❌ | Sending multiple requests without waiting for each response |
 | **macOS / BSD support** | ✅ | ❌ | wrk3 currently requires Linux (epoll); kqueue support not implemented |
-| **Histogram export** | Partial | ❌ | CSV/JSON export of raw histogram data |
+| **Histogram export** | Partial | ✅ | CSV/JSON export via `--export` flag |
 | **Config file support** | ❌ | ❌ | Neither tool supports config files |
 
 ### 🎯 wrk3 advantages over wrk2
@@ -177,7 +186,7 @@ wrk3 aims to be a modern, dependency-free alternative to wrk2. Here's where thin
 
 ## 🧪 Testing
 
-The project includes **50+ unit tests** across all modules:
+The project includes **60+ unit tests** across all modules:
 
 ```bash
 # Run all tests
@@ -189,7 +198,7 @@ zig build test -- --verbose
 
 | Module | Tests | Coverage |
 |--------|-------|----------|
-| Config | 13 | Arg parsing, URL validation, edge cases |
+| Config | 17 | Arg parsing, URL validation, export flags, edge cases |
 | Scheduler | 8 | Rate distribution, staggering, reset |
 | HttpParser | 11 | Chunked, keep-alive, malformed input |
 | Units | 11 | Parsing, formatting, round-trips |
@@ -197,6 +206,8 @@ zig build test -- --verbose
 | Socket | 6 | TCP, TLS, non-blocking I/O |
 | Connection | 5 | State machine, request formatting |
 | Stats | 5 | Aggregation, formatting, edge cases |
+| Histogram | 10 | Percentiles, merge, reset, iterator |
+| Export | 3 | CSV format, JSON format, empty histogram |
 | Worker | 3 | Init, distribution, integration |
 
 ## 📄 License
