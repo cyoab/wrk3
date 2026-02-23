@@ -287,6 +287,110 @@ pub const Histogram = struct {
             (self.sizeOfEquivalentValueRange(value) >> 1);
     }
 
+    // -- Percentile iteration ---------------------------------------------
+
+    pub const PercentileEntry = struct {
+        value: u64,
+        count: u64,
+        cumulative_count: u64,
+        percentile: f64,
+    };
+
+    pub const PercentileIterator = struct {
+        histogram: *const Histogram,
+        bucket_idx: u32,
+        sub_idx: u32,
+        cumulative_count: u64,
+        percentile_to_iterate_to: f64,
+        ticks_per_half_distance: f64,
+        reached_end: bool,
+
+        pub fn next(self: *PercentileIterator) ?PercentileEntry {
+            const h = self.histogram;
+            if (h.total_count == 0) return null;
+            if (self.reached_end) return null;
+
+            const total_f: f64 = @floatFromInt(h.total_count);
+
+            while (self.bucket_idx < h.bucket_count) {
+                const start_sub: u32 = if (self.bucket_idx == 0) 0 else h.sub_bucket_half_count;
+                if (self.sub_idx < start_sub) self.sub_idx = start_sub;
+
+                while (self.sub_idx < h.sub_bucket_count) {
+                    const idx = h.countsIndex(self.bucket_idx, self.sub_idx);
+                    const count = h.counts[idx];
+                    self.cumulative_count += count;
+
+                    const value_from_idx = h.valueFromIndex(self.bucket_idx, self.sub_idx);
+                    const value = h.highestEquivalentValue(value_from_idx);
+
+                    // Advance sub_idx for next call.
+                    self.sub_idx += 1;
+
+                    if (@as(f64, @floatFromInt(self.cumulative_count)) >= self.percentile_to_iterate_to / 100.0 * total_f) {
+                        const percentile = @min(self.percentile_to_iterate_to / 100.0, 1.0);
+                        // Advance percentile threshold using wrk2's logarithmic stepping.
+                        self.advancePercentile();
+
+                        if (self.cumulative_count >= h.total_count) {
+                            self.reached_end = true;
+                            return PercentileEntry{
+                                .value = value,
+                                .count = count,
+                                .cumulative_count = self.cumulative_count,
+                                .percentile = 1.0,
+                            };
+                        }
+
+                        return PercentileEntry{
+                            .value = value,
+                            .count = count,
+                            .cumulative_count = self.cumulative_count,
+                            .percentile = percentile,
+                        };
+                    }
+                }
+                self.bucket_idx += 1;
+                self.sub_idx = self.histogram.sub_bucket_half_count;
+            }
+
+            // If we exhausted all buckets without reaching total_count
+            // (shouldn't happen for a well-formed histogram), mark as done.
+            if (!self.reached_end and self.cumulative_count > 0) {
+                self.reached_end = true;
+                return PercentileEntry{
+                    .value = h.getMaxValue(),
+                    .count = 0,
+                    .cumulative_count = self.cumulative_count,
+                    .percentile = 1.0,
+                };
+            }
+            return null;
+        }
+
+        fn advancePercentile(self: *PercentileIterator) void {
+            const pct = self.percentile_to_iterate_to;
+            // wrk2's logarithmic stepping for fine tail resolution.
+            const remaining = 100.0 - pct;
+            if (remaining <= 0.0) return;
+            const half_distance = math.pow(f64, 2, @floor(math.log2(100.0 / remaining)) + 1);
+            const step = 100.0 / (self.ticks_per_half_distance * half_distance);
+            self.percentile_to_iterate_to = @min(pct + step, 100.0);
+        }
+    };
+
+    pub fn percentileIterator(self: *const Histogram) PercentileIterator {
+        return .{
+            .histogram = self,
+            .bucket_idx = 0,
+            .sub_idx = 0,
+            .cumulative_count = 0,
+            .percentile_to_iterate_to = 0.0,
+            .ticks_per_half_distance = 5.0,
+            .reached_end = false,
+        };
+    }
+
     // -- Static helpers for init ------------------------------------------
 
     fn bucketsNeeded(highest_trackable_value: u64, sub_bucket_count: u32, unit_mag: u8) u32 {
@@ -461,4 +565,94 @@ test "reset" {
     // Should be able to record again after reset
     _ = h.recordValue(500);
     try testing.expectEqual(@as(u64, 1), h.getTotalCount());
+}
+
+test "percentile iterator basic" {
+    const allocator = testing.allocator;
+    var h = try Histogram.init(allocator, 3_600_000_000, 3);
+    defer h.deinit(allocator);
+
+    // Record values 1 through 10_000
+    var i: u64 = 1;
+    while (i <= 10_000) : (i += 1) {
+        _ = h.recordValue(i);
+    }
+
+    var iter = h.percentileIterator();
+    var count: usize = 0;
+    var prev_percentile: f64 = -1.0;
+    var prev_cumulative: u64 = 0;
+    var last_percentile: f64 = 0.0;
+
+    while (iter.next()) |entry| {
+        // Percentile must be monotonically non-decreasing.
+        try testing.expect(entry.percentile >= prev_percentile);
+        // Cumulative count must be monotonically non-decreasing.
+        try testing.expect(entry.cumulative_count >= prev_cumulative);
+        prev_percentile = entry.percentile;
+        prev_cumulative = entry.cumulative_count;
+        last_percentile = entry.percentile;
+        count += 1;
+    }
+
+    // Must have produced entries and ended at percentile 1.0.
+    try testing.expect(count > 0);
+    try testing.expectEqual(@as(f64, 1.0), last_percentile);
+}
+
+test "percentile iterator empty histogram" {
+    const allocator = testing.allocator;
+    var h = try Histogram.init(allocator, 3_600_000_000, 3);
+    defer h.deinit(allocator);
+
+    var iter = h.percentileIterator();
+    try testing.expectEqual(@as(?Histogram.PercentileEntry, null), iter.next());
+}
+
+test "percentile iterator single value" {
+    const allocator = testing.allocator;
+    var h = try Histogram.init(allocator, 3_600_000_000, 3);
+    defer h.deinit(allocator);
+
+    _ = h.recordValue(42);
+
+    var iter = h.percentileIterator();
+    var count: usize = 0;
+    var last_percentile: f64 = 0.0;
+
+    while (iter.next()) |entry| {
+        last_percentile = entry.percentile;
+        count += 1;
+    }
+
+    // Should yield at least one entry ending at 1.0.
+    try testing.expect(count >= 1);
+    try testing.expectEqual(@as(f64, 1.0), last_percentile);
+}
+
+test "percentile iterator ordering" {
+    const allocator = testing.allocator;
+    var h = try Histogram.init(allocator, 3_600_000_000, 3);
+    defer h.deinit(allocator);
+
+    // Record a spread of values.
+    var i: u64 = 100;
+    while (i <= 50_000) : (i += 100) {
+        _ = h.recordValue(i);
+    }
+
+    var iter = h.percentileIterator();
+    var prev_percentile: f64 = -1.0;
+    var entry_count: usize = 0;
+
+    while (iter.next()) |entry| {
+        if (entry_count > 0) {
+            // Each entry's percentile must be > previous (strict increase after first).
+            try testing.expect(entry.percentile > prev_percentile);
+        }
+        prev_percentile = entry.percentile;
+        entry_count += 1;
+    }
+
+    try testing.expect(entry_count > 1);
 }

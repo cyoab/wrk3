@@ -7,6 +7,7 @@ const Worker = @import("wrk3").Worker.Worker;
 const StatsMod = @import("wrk3").Stats;
 const Stats = StatsMod.Stats;
 const Units = @import("wrk3").Units;
+const Export = @import("wrk3").Export;
 
 var stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var signal_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
@@ -114,6 +115,17 @@ pub fn main() !void {
     // Print results.
     try stats.formatReport(stdout, url_display, config.threads, config.connections, config.print_latency);
     try stdout.flush();
+
+    // Export histogram if requested.
+    if (config.export_config) |export_cfg| {
+        Export.exportHistogram(&stats.latency_histogram, export_cfg) catch |err| {
+            var err_buf2: [4096]u8 = undefined;
+            var err_writer2 = std.fs.File.stderr().writer(&err_buf2);
+            const stderr2 = &err_writer2.interface;
+            stderr2.print("Error: failed to export histogram to {s}: {}\n", .{ export_cfg.path, err }) catch {};
+            stderr2.flush() catch {};
+        };
+    }
 
     // Clean up workers.
     for (workers) |*w| {
