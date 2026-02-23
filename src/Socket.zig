@@ -42,6 +42,9 @@ const TlsState = struct {
     /// reads/writes encrypted data from/to.
     input_buf: [tls.Client.min_buffer_len]u8,
     output_buf: [tls.max_ciphertext_record_len]u8,
+    /// Additional buffers required by TLS Client Options.
+    read_buf: [tls.Client.min_buffer_len]u8,
+    write_buf: [tls.max_ciphertext_record_len]u8,
     /// The net.Stream.Reader wrapping the raw fd for reading encrypted data
     /// from the network.
     net_reader: net.Stream.Reader,
@@ -170,6 +173,8 @@ pub fn startTlsHandshake(self: *Socket, host: []const u8) !void {
 
     ts.input_buf = undefined;
     ts.output_buf = undefined;
+    ts.read_buf = undefined;
+    ts.write_buf = undefined;
     const stream: net.Stream = .{ .handle = self.fd };
     ts.net_reader = net.Stream.Reader.init(stream, &ts.input_buf);
     ts.net_writer = net.Stream.Writer.init(stream, &ts.output_buf);
@@ -188,6 +193,8 @@ pub fn startTlsHandshake(self: *Socket, host: []const u8) !void {
         .{
             .host = .{ .explicit = host },
             .ca = .no_verification,
+            .read_buffer = &ts.read_buf,
+            .write_buffer = &ts.write_buf,
         },
     ) catch {
         self.state = .disconnected;
