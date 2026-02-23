@@ -31,7 +31,7 @@ Constant-throughput load generation with accurate high-percentile latency measur
 Requires **Zig 0.15.2** or later.
 
 ```bash
-git clone https://github.com/yourusername/wrk3.git
+git clone https://github.com/cyoab/wrk3.git
 cd wrk3
 zig build -Doptimize=ReleaseFast
 ```
