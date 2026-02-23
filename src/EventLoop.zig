@@ -112,6 +112,14 @@ pub const EventLoop = struct {
         }
     }
 
+    /// Run the event loop until stop() is called or the external stop flag is set.
+    pub fn runUntilStopped(self: *EventLoop, stop_flag: *std.atomic.Value(bool)) void {
+        self.running = true;
+        while (self.running and !stop_flag.load(.acquire)) {
+            _ = self.poll(100);
+        }
+    }
+
     /// Create a timerfd, arm it, and register it with epoll.
     /// Returns the timerfd file descriptor.
     /// If interval_ns == 0, the timer is one-shot.
