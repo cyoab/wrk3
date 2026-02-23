@@ -165,7 +165,6 @@ wrk3 aims to be a modern, dependency-free alternative to wrk2. Here's where thin
 | **HTTP pipelining** | ✅ | ❌ | Sending multiple requests without waiting for each response |
 | **macOS / BSD support** | ✅ | ❌ | wrk3 currently requires Linux (epoll); kqueue support not implemented |
 | **Histogram export** | Partial | ❌ | CSV/JSON export of raw histogram data |
-| **Graceful shutdown** | ✅ | ❌ | Signal handling (Ctrl+C) with partial result reporting |
 | **Config file support** | ❌ | ❌ | Neither tool supports config files |
 
 ### 🎯 wrk3 advantages over wrk2
