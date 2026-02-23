@@ -48,7 +48,9 @@ pub const Error = error{
 // ============================================================================
 
 pub fn printUsage() void {
-    const stderr = std.io.getStdErr().writer();
+    var buf: [4096]u8 = undefined;
+    var writer = std.fs.File.stderr().writer(&buf);
+    const stderr = &writer.interface;
     stderr.writeAll(
         \\Usage: wrk3 <options> <url>
         \\  -c, --connections <N>   Number of connections (default: 10)
@@ -60,6 +62,7 @@ pub fn printUsage() void {
         \\      --timeout     <T>   Socket timeout (default: 2s)
         \\
     ) catch {};
+    stderr.flush() catch {};
 }
 
 // ============================================================================
