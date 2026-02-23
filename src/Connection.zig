@@ -7,6 +7,7 @@ const HttpParser = @import("HttpParser.zig").HttpParser;
 const Scheduler = @import("Scheduler.zig").Scheduler;
 const EventLoop = @import("EventLoop.zig").EventLoop;
 const Config = @import("Config.zig").Config;
+const Histogram = @import("Histogram.zig").Histogram;
 
 pub const Connection = struct {
     socket: Socket,
@@ -43,6 +44,10 @@ pub const Connection = struct {
     state: State,
     timer_fd: ?posix.fd_t,
     timeout_ns: u64,
+
+    // Latency recording (optional, set by Worker)
+    latency_histogram: ?*Histogram,
+    expected_interval: u64,
 
     pub const State = enum {
         disconnected,
@@ -92,6 +97,8 @@ pub const Connection = struct {
             .state = .disconnected,
             .timer_fd = null,
             .timeout_ns = timeout_ns,
+            .latency_histogram = null,
+            .expected_interval = 0,
         };
     }
 
@@ -331,7 +338,7 @@ pub const Connection = struct {
     /// (either because we completed a message and scheduled the next request,
     /// or because we hit an error and reconnected).
     fn processRecvBuffer(self: *Connection) bool {
-        while (self.recv_len > 0) {
+        while (true) {
             const event = self.parser.feed(self.recv_buf[0..self.recv_len]);
             const consumed = self.parser.consumed;
 
@@ -347,6 +354,20 @@ pub const Connection = struct {
                 .message_complete => {
                     self.complete_requests += 1;
 
+                    // Record latency in the histogram if one is set.
+                    if (self.latency_histogram) |histogram| {
+                        const now_ns = getMonotonicNs();
+                        const latency_ns = if (now_ns > self.intended_start_ns)
+                            now_ns - self.intended_start_ns
+                        else
+                            0;
+                        if (self.expected_interval > 0) {
+                            histogram.recordCorrectedValue(latency_ns, self.expected_interval);
+                        } else {
+                            _ = histogram.recordValue(latency_ns);
+                        }
+                    }
+
                     if (!self.parser.keep_alive) {
                         // Server wants to close the connection.
                         self.reconnect();
@@ -357,16 +378,21 @@ pub const Connection = struct {
                     return false;
                 },
                 .need_more_data => {
-                    // Need more data from the socket.
-                    return true;
+                    // If there is still data in the buffer, continue parsing
+                    // (the parser may have transitioned to a new state that
+                    // can consume the remaining bytes). Only return to the
+                    // caller to read more data when the buffer is truly empty.
+                    if (self.recv_len == 0) return true;
+                    continue;
                 },
                 .status, .header, .body_chunk => {
-                    // Continue parsing -- there may be more events in the buffer.
+                    // Continue parsing -- there may be more events in the buffer,
+                    // or the parser may be in the .done state and need one more
+                    // feed (with empty data) to emit message_complete.
                     continue;
                 },
             }
         }
-        return true;
     }
 
     /// On error: close the current socket, create a new one, and reconnect.
