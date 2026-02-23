@@ -8,6 +8,17 @@ const StatsMod = @import("wrk3").Stats;
 const Stats = StatsMod.Stats;
 const Units = @import("wrk3").Units;
 
+var stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var signal_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+fn handleSignal(_: c_int) callconv(.c) void {
+    const prev = signal_count.fetchAdd(1, .monotonic);
+    if (prev >= 1) {
+        std.process.exit(1);
+    }
+    stop_requested.store(true, .release);
+}
+
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -54,12 +65,21 @@ pub fn main() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &stdout_writer.interface;
 
+    // Install signal handlers for graceful shutdown.
+    const sa = posix.Sigaction{
+        .handler = .{ .handler = handleSignal },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &sa, null);
+    posix.sigaction(posix.SIG.TERM, &sa, null);
+
     // Create workers.
     const workers = try allocator.alloc(Worker, config.threads);
     defer allocator.free(workers);
 
     for (workers, 0..) |*w, i| {
-        w.* = try Worker.init(allocator, config, @intCast(i));
+        w.* = try Worker.init(allocator, config, @intCast(i), &stop_requested);
     }
 
     // Start all worker threads.
@@ -79,9 +99,16 @@ pub fn main() !void {
     var stats = try Stats.aggregate(allocator, worker_stats);
     defer stats.deinit(allocator);
 
-    // Override duration_ns with the configured value for display.
-    if (stats.duration_ns == 0) {
-        stats.duration_ns = config.duration_ns;
+    const interrupted = stop_requested.load(.acquire);
+
+    if (interrupted) {
+        stdout.writeAll("\n-- Interrupted (partial results) --\n\n") catch {};
+    } else {
+        // Override duration_ns with the configured value for display
+        // only when the run completed normally.
+        if (stats.duration_ns == 0) {
+            stats.duration_ns = config.duration_ns;
+        }
     }
 
     // Print results.

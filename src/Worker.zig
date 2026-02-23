@@ -38,12 +38,15 @@ pub const Worker = struct {
     duration_timer_fd: ?posix.fd_t,
     start_ns: u64,
 
+    // External stop flag (for graceful shutdown via signal)
+    stop_flag: *std.atomic.Value(bool),
+
     /// Initialize a Worker. Allocates connections, schedulers, and histogram.
     /// Does not start the thread or connect anything.
     ///
     /// `thread_index` is 0-based; the last thread may get extra connections if
     /// `config.connections` is not evenly divisible by `config.threads`.
-    pub fn init(allocator: std.mem.Allocator, config: Config, thread_index: u32) !Worker {
+    pub fn init(allocator: std.mem.Allocator, config: Config, thread_index: u32, stop_flag: *std.atomic.Value(bool)) !Worker {
         const base_conns = config.connections / config.threads;
         const remainder = config.connections % config.threads;
         // Distribute the remainder across the first `remainder` threads.
@@ -109,6 +112,7 @@ pub const Worker = struct {
             .result = null,
             .duration_timer_fd = null,
             .start_ns = 0,
+            .stop_flag = stop_flag,
         };
     }
 
@@ -183,8 +187,9 @@ pub const Worker = struct {
             @ptrCast(self),
         );
 
-        // Run the event loop until the duration timer fires and calls stop().
-        self.event_loop.run();
+        // Run the event loop until the duration timer fires, stop() is called,
+        // or the external stop flag is set (e.g. by a signal handler).
+        self.event_loop.runUntilStopped(self.stop_flag);
 
         // Collect results from all connections.
         self.collectResults();
@@ -273,8 +278,10 @@ test "worker init and deinit" {
         },
     };
 
+    var stop = std.atomic.Value(bool).init(false);
+
     // Thread 0 gets 5 connections (10 / 2).
-    var worker = try Worker.init(testing.allocator, config, 0);
+    var worker = try Worker.init(testing.allocator, config, 0, &stop);
     defer worker.deinit();
 
     // Verify field values.
@@ -322,11 +329,13 @@ test "worker connection distribution uneven" {
         },
     };
 
-    var w0 = try Worker.init(testing.allocator, config, 0);
+    var stop = std.atomic.Value(bool).init(false);
+
+    var w0 = try Worker.init(testing.allocator, config, 0, &stop);
     defer w0.deinit();
-    var w1 = try Worker.init(testing.allocator, config, 1);
+    var w1 = try Worker.init(testing.allocator, config, 1, &stop);
     defer w1.deinit();
-    var w2 = try Worker.init(testing.allocator, config, 2);
+    var w2 = try Worker.init(testing.allocator, config, 2, &stop);
     defer w2.deinit();
 
     try testing.expectEqual(@as(u32, 3), w0.connections_per_thread);
@@ -421,7 +430,9 @@ test "worker with local server" {
         },
     };
 
-    var worker = try Worker.init(testing.allocator, config, 0);
+    var stop = std.atomic.Value(bool).init(false);
+
+    var worker = try Worker.init(testing.allocator, config, 0, &stop);
     defer worker.deinit();
 
     try worker.start();
