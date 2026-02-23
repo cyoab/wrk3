@@ -19,6 +19,7 @@ Constant-throughput load generation with accurate high-percentile latency measur
 - **Multi-threaded** — distributes connections evenly across OS threads with epoll-based async I/O
 - **HTTPS support** — built-in TLS via Zig's standard library
 - **HTTP/1.1** — keep-alive, chunked transfer encoding, custom headers
+- **Zig scripting** — write benchmark scripts in Zig with `setup()`, `request()`, `response()`, `done()` hooks — compiled to shared libraries at runtime
 - **Zero dependencies** — pure Zig + stdlib, no C libraries, no vendored code
 - **wrk2-compatible output** — drop-in replacement for existing tooling and scripts
 - **Histogram export** — CSV and JSON export of latency data for post-processing and visualization
@@ -64,6 +65,7 @@ wrk3 [options] <url>
 | `-c, --connections <N>` | `10` | Total number of open connections |
 | `-d, --duration <T>` | `10s` | Test duration (`500ms`, `30s`, `1m`, `5h`) |
 | `-H, --header <H>` | — | Custom header, repeatable (`"Name: Value"`) |
+| `-s, --script <F>` | — | Zig script file for custom hooks |
 | `-L, --latency` | off | Print full latency percentile distribution |
 | `--timeout <T>` | `2s` | Socket timeout |
 | `--export <F:P>` | — | Export histogram (`csv:file.csv` or `json:file.json`) |
@@ -82,6 +84,12 @@ wrk3 -R 500 -c 50 -L \
   -H "Authorization: Bearer mytoken" \
   -H "Accept: application/json" \
   https://api.example.com/endpoint
+
+# Custom scripting: POST with JSON body
+wrk3 -R 500 -c 20 -s examples/post_json.zig http://localhost:8080
+
+# Dynamic paths via script
+wrk3 -R 1000 -c 50 -s examples/dynamic_path.zig http://localhost:8080
 
 # Export latency histogram to CSV or JSON
 wrk3 -R 1000 -d 30s --export csv:latency.csv http://localhost:8080
@@ -113,17 +121,19 @@ Transfer/sec:      1.50MB
 
 ```
 main.zig ─── CLI entry point
-  ├── Config        Parse CLI args and URL
-  ├── Worker[]      Spawn OS threads
-  │    ├── EventLoop    epoll-based async I/O
-  │    ├── Connection[] HTTP state machines
-  │    │    ├── Socket      TCP + TLS
-  │    │    ├── HttpParser  HTTP/1.1 response parser
-  │    │    ├── Scheduler   Constant-rate request pacer
-  │    │    └── Histogram   Per-connection latency recording
-  │    └── Timer        Duration tracking
-  ├── Export        CSV/JSON histogram export
-  └── Stats         Aggregate & report results
+  ├── Config         Parse CLI args and URL
+  ├── ScriptLoader   Compile .zig scripts → .so, resolve hooks
+  ├── Worker[]       Spawn OS threads
+  │    ├── EventLoop     epoll-based async I/O
+  │    ├── Connection[]  HTTP state machines
+  │    │    ├── Socket       TCP + TLS
+  │    │    ├── HttpParser   HTTP/1.1 response parser
+  │    │    ├── Scheduler    Constant-rate request pacer
+  │    │    ├── Histogram    Per-connection latency recording
+  │    │    └── ScriptApi    request()/response() hook dispatch
+  │    └── Timer         Duration tracking
+  ├── Export         CSV/JSON histogram export
+  └── Stats          Aggregate & report results
 ```
 
 | Module | Role |
@@ -137,8 +147,58 @@ main.zig ─── CLI entry point
 | `Worker` | Thread lifecycle, connection distribution, result collection |
 | `Stats` | Histogram merging, percentile computation, formatted output |
 | `Config` | Argument parsing, URL decomposition |
+| `ScriptApi` | Extern struct types shared across `.so` boundary (Request, Response, Summary) |
+| `ScriptLoader` | Compiles `.zig` scripts via `zig build-lib`, loads `.so` via `std.DynLib` |
 | `Export` | CSV and JSON histogram export via `--export` flag |
 | `Units` | Human-readable duration/count/byte formatting and parsing |
+
+## 📝 Scripting
+
+wrk3 supports custom benchmark scripts written in Zig. Scripts are compiled to shared libraries at runtime via `zig build-lib` and loaded dynamically — giving you full access to Zig's standard library with zero overhead when no script is provided.
+
+### Hooks
+
+| Hook | Signature | Called |
+|------|-----------|--------|
+| `setup` | `fn(*ThreadContext) void` | Once per thread, before connections start |
+| `request` | `fn(*Request) void` | Before each HTTP request is sent |
+| `response` | `fn(*const Response) void` | After each HTTP response is received |
+| `done` | `fn(*const Summary) void` | Once after the benchmark completes |
+
+All hooks are optional — export only the ones you need.
+
+### Example: POST with JSON body
+
+```zig
+const std = @import("std");
+const wrk3 = @import("wrk3_script");
+
+var counter: u64 = 0;
+
+export fn request(req: *wrk3.Request) callconv(.c) void {
+    counter += 1;
+    req.method = .POST;
+    req.path.set("/api/users");
+    req.headers.set("Content-Type: application/json\r\n");
+    var buf: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(&buf, "{{\"id\":{d}}}", .{counter}) catch return;
+    req.body.set(body);
+}
+```
+
+```bash
+wrk3 -R 500 -c 20 -s script.zig http://localhost:8080
+```
+
+### How it works
+
+1. wrk3 compiles your `.zig` file to a shared library using `zig build-lib -dynamic`
+2. Each worker thread loads the `.so` and resolves hook function pointers
+3. `request()` is called before each send — modify method, path, headers, body
+4. `response()` is called after each response — inspect status, headers, body
+5. `done()` is called once with a summary including latency percentiles
+
+See `examples/` for more scripts.
 
 ## 🔬 Coordinated Omission
 
@@ -161,15 +221,13 @@ wrk3 aims to be a modern, dependency-free alternative to wrk2. Here's where thin
 - HTTP/1.1 keep-alive and chunked encoding
 - wrk2-compatible output format
 - CSV/JSON histogram export (`--export`)
+- Scripting with `setup()`, `request()`, `response()`, `done()` hooks (`-s`)
 
 ### 🚧 Missing (not yet implemented)
 
 | Feature | wrk2 | wrk3 | Notes |
 |---------|------|------|-------|
-| **Lua scripting** (`-s`) | ✅ | ❌ | wrk2 supports `init()`, `request()`, `response()`, `done()` callbacks for custom request generation, response processing, and reporting |
 | **Uncorrected latency** (`--u_latency`) | ✅ | ❌ | wrk2 can show both corrected and uncorrected histograms side-by-side for comparison |
-| **Custom HTTP methods** | ✅ (via Lua) | ❌ | wrk2 supports POST, PUT, DELETE, etc. through Lua's `wrk.method` |
-| **Request bodies** | ✅ (via Lua) | ❌ | wrk2 supports setting `wrk.body` in Lua scripts |
 | **Thread calibration output** | ✅ | ❌ | wrk2 prints per-thread calibration stats (mean latency, sampling interval) |
 | **HTTP pipelining** | ✅ | ❌ | Sending multiple requests without waiting for each response |
 | **macOS / BSD support** | ✅ | ❌ | wrk3 currently requires Linux (epoll); kqueue support not implemented |
@@ -183,10 +241,11 @@ wrk3 aims to be a modern, dependency-free alternative to wrk2. Here's where thin
 - **Simpler build** — no Makefiles, no `pkg-config`, no linker flags
 - **Memory safe** — Zig's safety checks catch bugs that C misses
 - **Modern TLS** — uses Zig's built-in TLS, no OpenSSL version headaches
+- **Zig scripting** — scripts have access to the full Zig standard library instead of Lua
 
 ## 🧪 Testing
 
-The project includes **60+ unit tests** across all modules:
+The project includes **90+ unit tests** across all modules:
 
 ```bash
 # Run all tests
@@ -208,6 +267,8 @@ zig build test -- --verbose
 | Stats | 5 | Aggregation, formatting, edge cases |
 | Histogram | 10 | Percentiles, merge, reset, iterator |
 | Export | 3 | CSV format, JSON format, empty histogram |
+| ScriptApi | 3 | Buffer operations, set/slice, method names |
+| ScriptLoader | 2 | Compile + load, missing hooks resolution |
 | Worker | 3 | Init, distribution, integration |
 
 ## 📄 License

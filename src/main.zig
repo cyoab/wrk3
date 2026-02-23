@@ -8,6 +8,8 @@ const StatsMod = @import("wrk3").Stats;
 const Stats = StatsMod.Stats;
 const Units = @import("wrk3").Units;
 const Export = @import("wrk3").Export;
+const ScriptLoader = @import("wrk3").ScriptLoader.ScriptLoader;
+const ScriptApi = @import("wrk3").ScriptApi;
 
 var stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var signal_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
@@ -75,12 +77,36 @@ pub fn main() !void {
     posix.sigaction(posix.SIG.INT, &sa, null);
     posix.sigaction(posix.SIG.TERM, &sa, null);
 
+    // Compile script if provided.
+    var so_path: ?[]const u8 = null;
+    if (config.script_path) |script| {
+        stdout.print("Compiling script: {s}...\n", .{script}) catch {};
+        stdout.flush() catch {};
+        so_path = ScriptLoader.compile(allocator, script) catch |err| {
+            var err_buf3: [4096]u8 = undefined;
+            var err_writer3 = std.fs.File.stderr().writer(&err_buf3);
+            const stderr3 = &err_writer3.interface;
+            stderr3.print("Error: failed to compile script: {}\n", .{err}) catch {};
+            stderr3.flush() catch {};
+            std.process.exit(1);
+        };
+    }
+    defer if (so_path) |path| {
+        // Clean up temp .so file and its directory.
+        std.fs.deleteFileAbsolute(path) catch {};
+        if (std.mem.lastIndexOfScalar(u8, path, '/')) |last_slash| {
+            const dir_path = path[0..last_slash];
+            std.fs.deleteDirAbsolute(dir_path) catch {};
+        }
+        allocator.free(path);
+    };
+
     // Create workers.
     const workers = try allocator.alloc(Worker, config.threads);
     defer allocator.free(workers);
 
     for (workers, 0..) |*w, i| {
-        w.* = try Worker.init(allocator, config, @intCast(i), &stop_requested);
+        w.* = try Worker.init(allocator, config, @intCast(i), &stop_requested, so_path);
     }
 
     // Start all worker threads.
@@ -115,6 +141,31 @@ pub fn main() !void {
     // Print results.
     try stats.formatReport(stdout, url_display, config.threads, config.connections, config.print_latency);
     try stdout.flush();
+
+    // Call done() script hook if available.
+    if (so_path) |path| {
+        var done_loader = ScriptLoader.load(allocator, path) catch null;
+        if (done_loader) |*loader| {
+            defer loader.deinit();
+            if (loader.done_fn) |done_fn| {
+                const summary = ScriptApi.Summary{
+                    .total_requests = stats.total_requests,
+                    .total_errors = stats.total_errors,
+                    .total_bytes_read = stats.total_bytes_read,
+                    .total_bytes_written = stats.total_bytes_written,
+                    .duration_ns = stats.duration_ns,
+                    .avg_latency_ns = stats.avg_latency_ns,
+                    .max_latency_ns = stats.max_latency_ns,
+                    .p50_ns = stats.latency_histogram.valueAtPercentile(50.0),
+                    .p90_ns = stats.latency_histogram.valueAtPercentile(90.0),
+                    .p99_ns = stats.latency_histogram.valueAtPercentile(99.0),
+                    .p99_9_ns = stats.latency_histogram.valueAtPercentile(99.9),
+                    .p99_99_ns = stats.latency_histogram.valueAtPercentile(99.99),
+                };
+                done_fn(&summary);
+            }
+        }
+    }
 
     // Export histogram if requested.
     if (config.export_config) |export_cfg| {

@@ -10,6 +10,7 @@ pub const Connection = @import("Connection.zig");
 pub const Stats = @import("Stats.zig");
 pub const Worker = @import("Worker.zig");
 pub const ScriptApi = @import("ScriptApi.zig");
+pub const ScriptLoader = @import("ScriptLoader.zig");
 pub const Export = @import("Export.zig");
 
 test {
@@ -24,5 +25,6 @@ test {
     _ = Stats;
     _ = Worker;
     _ = ScriptApi;
+    _ = ScriptLoader;
     _ = Export;
 }

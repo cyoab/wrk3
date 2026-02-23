@@ -8,6 +8,8 @@ const Scheduler = @import("Scheduler.zig").Scheduler;
 const EventLoop = @import("EventLoop.zig").EventLoop;
 const Config = @import("Config.zig").Config;
 const Histogram = @import("Histogram.zig").Histogram;
+const ScriptApi = @import("ScriptApi.zig");
+const ScriptLoader = @import("ScriptLoader.zig").ScriptLoader;
 
 pub const Connection = struct {
     socket: Socket,
@@ -25,12 +27,28 @@ pub const Connection = struct {
     // Timing
     intended_start_ns: u64,
 
+    // Script support (null when no script)
+    script_request_fn: ?ScriptLoader.RequestFn = null,
+    script_response_fn: ?ScriptLoader.ResponseFn = null,
+
+    // Buffers for script request customization
+    script_path_buf: [2048]u8 = undefined,
+    script_headers_buf: [4096]u8 = undefined,
+    script_body_buf: [8192]u8 = undefined,
+
+    // Response buffering (only used when script_response_fn is set)
+    response_headers_buf: [4096]u8 = undefined,
+    response_headers_len: usize = 0,
+    response_body_buf: [8192]u8 = undefined,
+    response_body_len: usize = 0,
+    response_status: u16 = 0,
+
     // Buffers
     recv_buf: [16384]u8,
     recv_len: usize,
 
-    // Send buffer for partial writes
-    send_buf: [2048]u8,
+    // Send buffer for partial writes (16KB for scripted POST bodies)
+    send_buf: [16384]u8,
     send_len: usize,
     send_pos: usize,
 
@@ -109,8 +127,6 @@ pub const Connection = struct {
             return;
         };
 
-        // Register with event loop: watch for writable (connect completion) or
-        // handle post-connect immediately if already connected.
         if (self.socket.state == .connecting) {
             self.state = .connecting;
             self.event_loop.addFd(
@@ -120,7 +136,6 @@ pub const Connection = struct {
                 @ptrCast(self),
             );
         } else {
-            // Already connected (e.g., loopback), handle post-connect.
             self.handleConnected();
         }
     }
@@ -133,7 +148,6 @@ pub const Connection = struct {
         }
 
         if (self.socket.fd >= 0) {
-            // removeFd can fail if fd wasn't added; in deinit we ignore that.
             if (self.state != .disconnected) {
                 self.event_loop.removeFd(self.socket.fd);
             }
@@ -143,12 +157,10 @@ pub const Connection = struct {
         self.state = .disconnected;
     }
 
-    /// Main event callback registered with epoll. Dispatches based on
-    /// connection state.
+    /// Main event callback registered with epoll.
     pub fn onEvent(context: *anyopaque, events: u32) void {
         const self: *Connection = @ptrCast(@alignCast(context));
 
-        // Check for errors or hangup.
         if (events & (linux.EPOLL.ERR | linux.EPOLL.HUP) != 0) {
             self.errors += 1;
             self.reconnect();
@@ -157,7 +169,6 @@ pub const Connection = struct {
 
         switch (self.state) {
             .connecting => {
-                // EPOLLOUT when connecting means connect completed (or failed).
                 if (events & linux.EPOLL.OUT != 0) {
                     const connected = self.socket.checkConnect() catch {
                         self.errors += 1;
@@ -170,9 +181,6 @@ pub const Connection = struct {
                 }
             },
             .tls_handshake => {
-                // TLS handshake is done synchronously in startTlsHandshake,
-                // so this state shouldn't normally fire from epoll. If it does,
-                // treat it as an error.
                 self.errors += 1;
                 self.reconnect();
             },
@@ -186,9 +194,7 @@ pub const Connection = struct {
                     self.handleRecv();
                 }
             },
-            .waiting, .disconnected => {
-                // Shouldn't get events in these states; ignore.
-            },
+            .waiting, .disconnected => {},
         }
     }
 
@@ -196,7 +202,6 @@ pub const Connection = struct {
     pub fn onTimerEvent(context: *anyopaque, _: u32) void {
         const self: *Connection = @ptrCast(@alignCast(context));
 
-        // Clean up the one-shot timer.
         if (self.timer_fd) |tfd| {
             self.event_loop.removeTimer(tfd);
             self.timer_fd = null;
@@ -205,9 +210,7 @@ pub const Connection = struct {
         self.sendRequest();
     }
 
-    /// After a response completes, use the scheduler to determine when to
-    /// send the next request. If the scheduled time is in the past, send
-    /// immediately; otherwise arm a timer.
+    /// Schedule the next request based on the scheduler's timing.
     pub fn scheduleNextRequest(self: *Connection) void {
         self.intended_start_ns = self.scheduler.nextSendTime();
         self.scheduler.advance();
@@ -215,46 +218,66 @@ pub const Connection = struct {
         const now_ns = getMonotonicNs();
 
         if (self.intended_start_ns <= now_ns) {
-            // Send immediately.
             self.sendRequest();
         } else {
-            // Set a one-shot timer for the remaining delay.
             const delay_ns = self.intended_start_ns - now_ns;
             self.state = .waiting;
 
-            // Modify the fd to not watch for anything while waiting.
             self.event_loop.modifyFd(
                 self.socket.fd,
-                0, // no events
+                0,
                 &onEvent,
                 @ptrCast(self),
             );
 
             self.timer_fd = self.event_loop.addTimer(
                 delay_ns,
-                0, // one-shot
+                0,
                 &onTimerEvent,
                 @ptrCast(self),
             );
         }
     }
 
-    /// Format and send the HTTP GET request.
+    /// Format and send an HTTP request. When a script request function is
+    /// set, the script gets to customize method, path, headers, and body.
     pub fn sendRequest(self: *Connection) void {
-        const len = formatRequest(
-            &self.send_buf,
-            self.path,
-            self.host,
-            self.headers,
-        );
-        self.send_len = len;
+        if (self.script_request_fn) |request_fn| {
+            const path_len = @min(self.path.len, self.script_path_buf.len);
+            @memcpy(self.script_path_buf[0..path_len], self.path[0..path_len]);
+
+            const host_header_len = formatHostHeader(&self.script_headers_buf, self.host);
+
+            var req = ScriptApi.Request{
+                .method = .GET,
+                .path = .{ .ptr = &self.script_path_buf, .len = path_len, .cap = self.script_path_buf.len },
+                .headers = .{ .ptr = &self.script_headers_buf, .len = host_header_len, .cap = self.script_headers_buf.len },
+                .body = .{ .ptr = &self.script_body_buf, .len = 0, .cap = self.script_body_buf.len },
+            };
+
+            request_fn(&req);
+
+            const len = formatScriptRequest(&self.send_buf, &req, self.host);
+            self.send_len = len;
+        } else {
+            const len = formatRequest(
+                &self.send_buf,
+                self.path,
+                self.host,
+                self.headers,
+            );
+            self.send_len = len;
+        }
         self.send_pos = 0;
 
         self.state = .sending;
         self.parser = HttpParser.init();
         self.recv_len = 0;
 
-        // Try to send right away.
+        self.response_headers_len = 0;
+        self.response_body_len = 0;
+        self.response_status = 0;
+
         self.continueSend();
     }
 
@@ -264,7 +287,6 @@ pub const Connection = struct {
             const sent = self.socket.send(self.send_buf[self.send_pos..self.send_len]) catch |err| {
                 switch (err) {
                     error.WouldBlock => {
-                        // Register for EPOLLOUT to continue later.
                         self.event_loop.modifyFd(
                             self.socket.fd,
                             linux.EPOLL.OUT,
@@ -291,7 +313,6 @@ pub const Connection = struct {
             self.bytes_written += sent;
         }
 
-        // All data sent -- switch to receiving.
         self.state = .receiving;
         self.event_loop.modifyFd(
             self.socket.fd,
@@ -316,8 +337,6 @@ pub const Connection = struct {
             };
 
             if (n == 0) {
-                // Connection closed by peer.
-                // If we were expecting data, this is an error.
                 if (self.state == .receiving) {
                     self.errors += 1;
                 }
@@ -328,21 +347,16 @@ pub const Connection = struct {
             self.recv_len += n;
             self.bytes_read += n;
 
-            // Feed buffered data to the parser.
             if (!self.processRecvBuffer()) return;
         }
     }
 
     /// Feed the receive buffer to the parser, processing events.
-    /// Returns true if we should continue reading, false if we should stop
-    /// (either because we completed a message and scheduled the next request,
-    /// or because we hit an error and reconnected).
     fn processRecvBuffer(self: *Connection) bool {
         while (true) {
             const event = self.parser.feed(self.recv_buf[0..self.recv_len]);
             const consumed = self.parser.consumed;
 
-            // Shift consumed bytes out of the buffer.
             if (consumed > 0 and consumed < self.recv_len) {
                 std.mem.copyForwards(u8, &self.recv_buf, self.recv_buf[consumed..self.recv_len]);
                 self.recv_len -= consumed;
@@ -354,7 +368,16 @@ pub const Connection = struct {
                 .message_complete => {
                     self.complete_requests += 1;
 
-                    // Record latency in the histogram if one is set.
+                    // Call script response hook if present.
+                    if (self.script_response_fn) |response_fn| {
+                        const resp = ScriptApi.Response{
+                            .status = self.response_status,
+                            .headers = .{ .ptr = &self.response_headers_buf, .len = self.response_headers_len },
+                            .body = .{ .ptr = &self.response_body_buf, .len = self.response_body_len },
+                        };
+                        response_fn(&resp);
+                    }
+
                     if (self.latency_histogram) |histogram| {
                         const now_ns = getMonotonicNs();
                         const latency_ns = if (now_ns > self.intended_start_ns)
@@ -369,7 +392,6 @@ pub const Connection = struct {
                     }
 
                     if (!self.parser.keep_alive) {
-                        // Server wants to close the connection.
                         self.reconnect();
                         return false;
                     }
@@ -378,17 +400,39 @@ pub const Connection = struct {
                     return false;
                 },
                 .need_more_data => {
-                    // If there is still data in the buffer, continue parsing
-                    // (the parser may have transitioned to a new state that
-                    // can consume the remaining bytes). Only return to the
-                    // caller to read more data when the buffer is truly empty.
                     if (self.recv_len == 0) return true;
                     continue;
                 },
-                .status, .header, .body_chunk => {
-                    // Continue parsing -- there may be more events in the buffer,
-                    // or the parser may be in the .done state and need one more
-                    // feed (with empty data) to emit message_complete.
+                .status => |code| {
+                    self.response_status = code;
+                    continue;
+                },
+                .header => |h| {
+                    if (self.script_response_fn != null) {
+                        const needed = h.name.len + 2 + h.value.len + 2;
+                        const avail = self.response_headers_buf.len - self.response_headers_len;
+                        if (needed <= avail) {
+                            var pos = self.response_headers_len;
+                            @memcpy(self.response_headers_buf[pos..][0..h.name.len], h.name);
+                            pos += h.name.len;
+                            @memcpy(self.response_headers_buf[pos..][0..2], ": ");
+                            pos += 2;
+                            @memcpy(self.response_headers_buf[pos..][0..h.value.len], h.value);
+                            pos += h.value.len;
+                            @memcpy(self.response_headers_buf[pos..][0..2], "\r\n");
+                            pos += 2;
+                            self.response_headers_len = pos;
+                        }
+                    }
+                    continue;
+                },
+                .body_chunk => |chunk| {
+                    if (self.script_response_fn != null) {
+                        const avail = self.response_body_buf.len - self.response_body_len;
+                        const copy_len = @min(chunk.len, avail);
+                        @memcpy(self.response_body_buf[self.response_body_len..][0..copy_len], chunk[0..copy_len]);
+                        self.response_body_len += copy_len;
+                    }
                     continue;
                 },
             }
@@ -397,13 +441,11 @@ pub const Connection = struct {
 
     /// On error: close the current socket, create a new one, and reconnect.
     pub fn reconnect(self: *Connection) void {
-        // Cancel any pending timer.
         if (self.timer_fd) |tfd| {
             self.event_loop.removeTimer(tfd);
             self.timer_fd = null;
         }
 
-        // Remove from event loop and close the socket.
         if (self.socket.fd >= 0) {
             if (self.state != .disconnected) {
                 self.event_loop.removeFd(self.socket.fd);
@@ -417,19 +459,11 @@ pub const Connection = struct {
         self.send_len = 0;
         self.parser = HttpParser.init();
 
-        // Reset the scheduler so we don't get a burst of catch-up requests.
         self.scheduler.reset(getMonotonicNs());
 
-        // Reconnect.
         self.connect();
     }
 
-    // -------------------------------------------------------------------
-    // Internal helpers
-    // -------------------------------------------------------------------
-
-    /// Handle the transition after TCP connect completes (possibly do TLS,
-    /// then schedule the first request).
     fn handleConnected(self: *Connection) void {
         if (self.use_tls) {
             self.state = .tls_handshake;
@@ -440,8 +474,6 @@ pub const Connection = struct {
             };
         }
 
-        // Now connected (plain or TLS handshake done).
-        // Register for reading + writing and schedule the first request.
         self.event_loop.modifyFd(
             self.socket.fd,
             linux.EPOLL.IN,
@@ -452,14 +484,63 @@ pub const Connection = struct {
         self.scheduleNextRequest();
     }
 
-    /// Get the current monotonic clock time in nanoseconds.
     fn getMonotonicNs() u64 {
         const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
         return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
     }
 
+    fn formatHostHeader(buf: []u8, host: []const u8) usize {
+        var pos: usize = 0;
+        pos = appendSlice(buf, pos, "Host: ");
+        pos = appendSlice(buf, pos, host);
+        pos = appendSlice(buf, pos, "\r\n");
+        return pos;
+    }
+
+    /// Format an HTTP request from a ScriptApi.Request.
+    pub fn formatScriptRequest(
+        buf: []u8,
+        req: *const ScriptApi.Request,
+        host: []const u8,
+    ) usize {
+        var pos: usize = 0;
+
+        pos = appendSlice(buf, pos, ScriptApi.methodName(req.method));
+        pos = appendSlice(buf, pos, " ");
+        pos = appendSlice(buf, pos, req.path.slice());
+        pos = appendSlice(buf, pos, " HTTP/1.1\r\n");
+
+        const headers_data = req.headers.slice();
+        const has_host = std.mem.indexOf(u8, headers_data, "Host:") != null or
+            std.mem.indexOf(u8, headers_data, "host:") != null;
+
+        if (!has_host) {
+            pos = appendSlice(buf, pos, "Host: ");
+            pos = appendSlice(buf, pos, host);
+            pos = appendSlice(buf, pos, "\r\n");
+        }
+
+        pos = appendSlice(buf, pos, headers_data);
+
+        const body_data = req.body.slice();
+        if (body_data.len > 0) {
+            pos = appendSlice(buf, pos, "Content-Length: ");
+            var len_buf: [20]u8 = undefined;
+            const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body_data.len}) catch "";
+            pos = appendSlice(buf, pos, len_str);
+            pos = appendSlice(buf, pos, "\r\n");
+        }
+
+        pos = appendSlice(buf, pos, "\r\n");
+
+        if (body_data.len > 0) {
+            pos = appendSlice(buf, pos, body_data);
+        }
+
+        return pos;
+    }
+
     /// Format an HTTP GET request into the provided buffer.
-    /// Returns the number of bytes written.
     pub fn formatRequest(
         buf: []u8,
         path: []const u8,
@@ -468,17 +549,14 @@ pub const Connection = struct {
     ) usize {
         var pos: usize = 0;
 
-        // "GET {path} HTTP/1.1\r\n"
         pos = appendSlice(buf, pos, "GET ");
         pos = appendSlice(buf, pos, path);
         pos = appendSlice(buf, pos, " HTTP/1.1\r\n");
 
-        // "Host: {host}\r\n"
         pos = appendSlice(buf, pos, "Host: ");
         pos = appendSlice(buf, pos, host);
         pos = appendSlice(buf, pos, "\r\n");
 
-        // Custom headers
         for (headers) |header| {
             pos = appendSlice(buf, pos, header.name);
             pos = appendSlice(buf, pos, ": ");
@@ -486,14 +564,11 @@ pub const Connection = struct {
             pos = appendSlice(buf, pos, "\r\n");
         }
 
-        // Final CRLF
         pos = appendSlice(buf, pos, "\r\n");
 
         return pos;
     }
 
-    /// Append a slice to the buffer at the given position. Returns the new
-    /// position. If the buffer would overflow, writes as much as fits.
     fn appendSlice(buf: []u8, pos: usize, data: []const u8) usize {
         const available = buf.len - pos;
         const to_copy = @min(data.len, available);
@@ -511,7 +586,6 @@ const testing = std.testing;
 test "request formatting" {
     var buf: [2048]u8 = undefined;
 
-    // Basic request with no custom headers.
     {
         const headers: []const Config.Header = &.{};
         const len = Connection.formatRequest(&buf, "/", "example.com", headers);
@@ -519,7 +593,6 @@ test "request formatting" {
         try testing.expectEqualStrings(expected, buf[0..len]);
     }
 
-    // Request with path and custom headers.
     {
         const headers: []const Config.Header = &.{
             .{ .name = "Accept", .value = "text/html" },
@@ -535,7 +608,6 @@ test "request formatting" {
         try testing.expectEqualStrings(expected, buf[0..len]);
     }
 
-    // Request with empty path (should still work).
     {
         const headers: []const Config.Header = &.{};
         const len = Connection.formatRequest(&buf, "/index.html", "localhost", headers);
@@ -544,9 +616,42 @@ test "request formatting" {
     }
 }
 
+test "script request formatting" {
+    var buf: [4096]u8 = undefined;
+    var path_buf: [2048]u8 = undefined;
+    var headers_buf: [4096]u8 = undefined;
+    var body_buf: [8192]u8 = undefined;
+
+    {
+        const path = "/api/users";
+        @memcpy(path_buf[0..path.len], path);
+
+        const hdrs = "Content-Type: application/json\r\n";
+        @memcpy(headers_buf[0..hdrs.len], hdrs);
+
+        const body = "{\"name\":\"test\"}";
+        @memcpy(body_buf[0..body.len], body);
+
+        const req = ScriptApi.Request{
+            .method = .POST,
+            .path = .{ .ptr = &path_buf, .len = path.len, .cap = path_buf.len },
+            .headers = .{ .ptr = &headers_buf, .len = hdrs.len, .cap = headers_buf.len },
+            .body = .{ .ptr = &body_buf, .len = body.len, .cap = body_buf.len },
+        };
+
+        const len = Connection.formatScriptRequest(&buf, &req, "example.com");
+        const expected =
+            "POST /api/users HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Content-Length: 15\r\n" ++
+            "\r\n" ++
+            "{\"name\":\"test\"}";
+        try testing.expectEqualStrings(expected, buf[0..len]);
+    }
+}
+
 test "connection init" {
-    // We need a valid Scheduler and EventLoop for init. We can create a
-    // Scheduler on the stack; for the EventLoop we need to allocate.
     const el = try EventLoop.init();
     defer el.deinit();
 
@@ -576,6 +681,8 @@ test "connection init" {
     try testing.expectEqual(@as(usize, 0), conn.recv_len);
     try testing.expectEqual(@as(?posix.fd_t, null), conn.timer_fd);
     try testing.expectEqual(@as(u64, 2_000_000_000), conn.timeout_ns);
+    try testing.expect(conn.script_request_fn == null);
+    try testing.expect(conn.script_response_fn == null);
 }
 
 test "state transitions" {
@@ -596,30 +703,21 @@ test "state transitions" {
         2_000_000_000,
     );
 
-    // Initial state should be disconnected.
     try testing.expectEqual(Connection.State.disconnected, conn.state);
-
-    // Socket fd should be -1 before connect.
     try testing.expectEqual(@as(posix.fd_t, -1), conn.socket.fd);
-
-    // After init, all counters should be zero.
     try testing.expectEqual(@as(u64, 0), conn.complete_requests);
     try testing.expectEqual(@as(u64, 0), conn.bytes_read);
     try testing.expectEqual(@as(u64, 0), conn.bytes_written);
     try testing.expectEqual(@as(u64, 0), conn.errors);
-
-    // Verify the parser is in its initial state.
     try testing.expectEqual(@as(u16, 0), conn.parser.status_code);
     try testing.expect(conn.parser.keep_alive);
 }
 
 test "format request buffer overflow protection" {
-    // Use a very small buffer to verify we don't crash.
     var small_buf: [10]u8 = undefined;
     const headers: []const Config.Header = &.{};
     const len = Connection.formatRequest(&small_buf, "/", "example.com", headers);
 
-    // Should fill the buffer without overflowing.
     try testing.expectEqual(@as(usize, 10), len);
     try testing.expectEqualStrings("GET / HTTP", &small_buf);
 }
