@@ -13,8 +13,16 @@ pub const Config = struct {
     rate: u64, // required, no default
     timeout_ns: u64 = 2_000_000_000, // 2s default
     print_latency: bool = false,
+    script_path: ?[]const u8 = null,
+    export_config: ?ExportConfig = null,
     headers: []Header,
     url: Url,
+
+    pub const ExportFormat = enum { csv, json };
+    pub const ExportConfig = struct {
+        format: ExportFormat,
+        path: []const u8,
+    };
 
     pub const Header = struct {
         name: []const u8,
@@ -58,8 +66,10 @@ pub fn printUsage() void {
         \\  -t, --threads     <N>   Number of threads (default: 2)
         \\  -R, --rate        <N>   Target requests/sec (required)
         \\  -H, --header      <H>   Add header (repeatable), format "Name: Value"
+        \\  -s, --script      <F>   Zig script file for custom hooks
         \\  -L, --latency           Print latency percentile distribution
         \\      --timeout     <T>   Socket timeout (default: 2s)
+        \\      --export      <F:P> Export histogram (csv:file.csv or json:file.json)
         \\
     ) catch {};
     stderr.flush() catch {};
@@ -128,6 +138,8 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) Error!Confi
     var rate: ?u64 = null;
     var timeout_ns: u64 = 2_000_000_000;
     var print_latency: bool = false;
+    var script_path: ?[]const u8 = null;
+    var export_config: ?Config.ExportConfig = null;
     var header_list: std.ArrayList(Config.Header) = .empty;
     defer header_list.deinit(allocator);
     var url_str: ?[]const u8 = null;
@@ -163,6 +175,14 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) Error!Confi
             header_list.append(allocator, header) catch return error.OutOfMemory;
         } else if (std.mem.eql(u8, arg, "-L") or std.mem.eql(u8, arg, "--latency")) {
             print_latency = true;
+        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--script")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgument;
+            script_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--export")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArgument;
+            export_config = parseExportArg(args[i]) orelse return error.InvalidArgument;
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             // Positional argument — treat as URL.
             url_str = arg;
@@ -184,6 +204,8 @@ pub fn parse(allocator: std.mem.Allocator, args: []const []const u8) Error!Confi
         .rate = rate.?,
         .timeout_ns = timeout_ns,
         .print_latency = print_latency,
+        .script_path = script_path,
+        .export_config = export_config,
         .headers = headers,
         .url = url,
     };
@@ -208,6 +230,25 @@ fn parseHeader(s: []const u8) ?Config.Header {
     return .{
         .name = name,
         .value = value,
+    };
+}
+
+fn parseExportArg(s: []const u8) ?Config.ExportConfig {
+    const colon_pos = std.mem.indexOfScalar(u8, s, ':') orelse return null;
+    const format_str = s[0..colon_pos];
+    const path = s[colon_pos + 1 ..];
+    if (path.len == 0) return null;
+
+    const format: Config.ExportFormat = if (std.mem.eql(u8, format_str, "csv"))
+        .csv
+    else if (std.mem.eql(u8, format_str, "json"))
+        .json
+    else
+        return null;
+
+    return .{
+        .format = format,
+        .path = path,
     };
 }
 
@@ -338,6 +379,22 @@ test "missing url error" {
     try testing.expectError(error.MissingUrl, result);
 }
 
+test "script flag" {
+    const args = [_][]const u8{ "-R", "100", "-s", "script.zig", "http://localhost" };
+    const config = try parse(testing.allocator, &args);
+    defer testing.allocator.free(config.headers);
+
+    try testing.expectEqualStrings("script.zig", config.script_path.?);
+}
+
+test "no script flag returns null" {
+    const args = [_][]const u8{ "-R", "100", "http://localhost" };
+    const config = try parse(testing.allocator, &args);
+    defer testing.allocator.free(config.headers);
+
+    try testing.expectEqual(@as(?[]const u8, null), config.script_path);
+}
+
 test "long form args" {
     const args = [_][]const u8{
         "--connections", "50",
@@ -353,4 +410,36 @@ test "long form args" {
     try testing.expectEqual(@as(u32, 50), config.connections);
     try testing.expectEqual(@as(u64, 30_000_000_000), config.duration_ns);
     try testing.expectEqual(@as(u64, 500), config.rate);
+}
+
+test "export csv flag" {
+    const args = [_][]const u8{ "-R", "100", "--export", "csv:results.csv", "http://localhost" };
+    const config = try parse(testing.allocator, &args);
+    defer testing.allocator.free(config.headers);
+
+    try testing.expect(config.export_config != null);
+    try testing.expectEqual(Config.ExportFormat.csv, config.export_config.?.format);
+    try testing.expectEqualStrings("results.csv", config.export_config.?.path);
+}
+
+test "export json flag" {
+    const args = [_][]const u8{ "-R", "100", "--export", "json:out.json", "http://localhost" };
+    const config = try parse(testing.allocator, &args);
+    defer testing.allocator.free(config.headers);
+
+    try testing.expect(config.export_config != null);
+    try testing.expectEqual(Config.ExportFormat.json, config.export_config.?.format);
+    try testing.expectEqualStrings("out.json", config.export_config.?.path);
+}
+
+test "export invalid format" {
+    const args = [_][]const u8{ "-R", "100", "--export", "xml:out.xml", "http://localhost" };
+    const result = parse(testing.allocator, &args);
+    try testing.expectError(error.InvalidArgument, result);
+}
+
+test "export empty path" {
+    const args = [_][]const u8{ "-R", "100", "--export", "csv:", "http://localhost" };
+    const result = parse(testing.allocator, &args);
+    try testing.expectError(error.InvalidArgument, result);
 }
