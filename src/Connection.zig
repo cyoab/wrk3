@@ -212,6 +212,13 @@ pub const Connection = struct {
 
     /// Schedule the next request based on the scheduler's timing.
     pub fn scheduleNextRequest(self: *Connection) void {
+        // Skip past missed scheduled times. The corrected histogram recording
+        // already accounts for missed slots via backfilling, so sending
+        // catch-up requests would double-count the correction.
+        if (self.expected_interval > 0) {
+            _ = self.scheduler.skipPast(getMonotonicNs());
+        }
+
         self.intended_start_ns = self.scheduler.nextSendTime();
         self.scheduler.advance();
 

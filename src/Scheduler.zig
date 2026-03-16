@@ -74,6 +74,20 @@ pub const Scheduler = struct {
         self.thread_start_ns = new_start_ns;
         self.scheduled_count = 0;
     }
+
+    /// Skip past any scheduled send times before `now_ns`. Returns the
+    /// number of slots skipped. Used to prevent catch-up bursts after a
+    /// stall — the corrected histogram already accounts for missed slots
+    /// via backfilling.
+    pub fn skipPast(self: *Scheduler, now_ns: u64) u64 {
+        const next = self.nextSendTime();
+        if (next >= now_ns) return 0;
+
+        const behind = now_ns - next;
+        const skip = behind / self.interval_ns;
+        self.scheduled_count += skip;
+        return skip;
+    }
 };
 
 // ============================================================================
@@ -173,4 +187,45 @@ test "reset" {
 
     // nextSendTime should reflect the new baseline.
     try testing.expectEqual(new_start + s.offset_ns, s.nextSendTime());
+}
+
+test "skipPast when on time" {
+    var s = Scheduler.init(100, 2, 5, 0, 1_000_000_000);
+    const before = s.scheduled_count;
+    const skipped = s.skipPast(s.nextSendTime());
+    try testing.expectEqual(@as(u64, 0), skipped);
+    try testing.expectEqual(before, s.scheduled_count);
+}
+
+test "skipPast when behind by several intervals" {
+    // 100 req/s, 2 threads, 5 conns → interval = 100ms
+    var s = Scheduler.init(100, 2, 5, 0, 0);
+    const interval = s.interval_ns; // 100_000_000
+
+    // Simulate being 550ms behind (5.5 intervals)
+    const now_ns: u64 = 550_000_000;
+    const skipped = s.skipPast(now_ns);
+    try testing.expectEqual(@as(u64, 5), skipped);
+    try testing.expectEqual(@as(u64, 5), s.scheduled_count);
+
+    // nextSendTime should now be within one interval of now_ns
+    const next = s.nextSendTime();
+    try testing.expect(next <= now_ns);
+    try testing.expect(next + interval > now_ns);
+}
+
+test "skipPast when behind by less than one interval" {
+    var s = Scheduler.init(100, 2, 5, 0, 0);
+    // 50ms behind with 100ms interval — less than one full interval
+    const skipped = s.skipPast(50_000_000);
+    try testing.expectEqual(@as(u64, 0), skipped);
+    try testing.expectEqual(@as(u64, 0), s.scheduled_count);
+}
+
+test "skipPast when nextSendTime is in the future" {
+    var s = Scheduler.init(100, 2, 5, 0, 1_000_000_000);
+    // now_ns is before thread_start_ns, so nextSendTime is in the future
+    const skipped = s.skipPast(500_000_000);
+    try testing.expectEqual(@as(u64, 0), skipped);
+    try testing.expectEqual(@as(u64, 0), s.scheduled_count);
 }
