@@ -133,10 +133,10 @@ pub const Worker = struct {
             self.duration_timer_fd = null;
         }
 
-        if (self.script_loader) |*loader| {
-            loader.deinit();
-            self.script_loader = null;
-        }
+        // Skip dlclose — Worker.deinit() only runs at process exit, and
+        // dlclose on Zig-compiled .so files can segfault due to runtime
+        // destructor ordering. The OS reclaims all resources on exit.
+        self.script_loader = null;
 
         self.allocator.free(self.connections);
         self.allocator.free(self.schedulers);

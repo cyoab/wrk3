@@ -142,29 +142,31 @@ pub fn main() !void {
     try stats.formatReport(stdout, url_display, config.threads, config.connections, config.print_latency);
     try stdout.flush();
 
-    // Call done() script hook if available.
-    if (so_path) |path| {
-        var done_loader = ScriptLoader.load(allocator, path) catch null;
-        if (done_loader) |*loader| {
-            defer loader.deinit();
-            if (loader.done_fn) |done_fn| {
-                const summary = ScriptApi.Summary{
-                    .total_requests = stats.total_requests,
-                    .total_errors = stats.total_errors,
-                    .total_bytes_read = stats.total_bytes_read,
-                    .total_bytes_written = stats.total_bytes_written,
-                    .duration_ns = stats.duration_ns,
-                    .avg_latency_ns = stats.avg_latency_ns,
-                    .max_latency_ns = stats.max_latency_ns,
-                    .p50_ns = stats.latency_histogram.valueAtPercentile(50.0),
-                    .p90_ns = stats.latency_histogram.valueAtPercentile(90.0),
-                    .p99_ns = stats.latency_histogram.valueAtPercentile(99.0),
-                    .p99_9_ns = stats.latency_histogram.valueAtPercentile(99.9),
-                    .p99_99_ns = stats.latency_histogram.valueAtPercentile(99.99),
-                };
-                done_fn(&summary);
-            }
+    // Call done() script hook using an existing worker's loaded script.
+    // Avoids extra dlopen/dlclose and ensures done() sees accumulated script state.
+    var done_fn: ?ScriptLoader.DoneFn = null;
+    for (workers) |*w| {
+        if (w.script_loader) |loader| {
+            done_fn = loader.done_fn;
+            break;
         }
+    }
+    if (done_fn) |df| {
+        const summary = ScriptApi.Summary{
+            .total_requests = stats.total_requests,
+            .total_errors = stats.total_errors,
+            .total_bytes_read = stats.total_bytes_read,
+            .total_bytes_written = stats.total_bytes_written,
+            .duration_ns = stats.duration_ns,
+            .avg_latency_ns = stats.avg_latency_ns,
+            .max_latency_ns = stats.max_latency_ns,
+            .p50_ns = stats.latency_histogram.valueAtPercentile(50.0),
+            .p90_ns = stats.latency_histogram.valueAtPercentile(90.0),
+            .p99_ns = stats.latency_histogram.valueAtPercentile(99.0),
+            .p99_9_ns = stats.latency_histogram.valueAtPercentile(99.9),
+            .p99_99_ns = stats.latency_histogram.valueAtPercentile(99.99),
+        };
+        df(&summary);
     }
 
     // Export histogram if requested.
