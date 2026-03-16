@@ -212,6 +212,74 @@ test "ScriptLoader compile and load simple script" {
     try testing.expectEqualStrings("/test", req.path.slice());
 }
 
+test "ScriptLoader done callback executes with correct summary" {
+    const allocator = testing.allocator;
+
+    // Write a script that exports done() and writes summary fields to a marker file.
+    const script_content =
+        \\const wrk3 = @import("wrk3_script");
+        \\const std = @import("std");
+        \\
+        \\export fn done(summary: *const wrk3.Summary) callconv(.c) void {
+        \\    const file = std.fs.createFileAbsolute("/tmp/wrk3_test_done_marker.txt", .{}) catch return;
+        \\    defer file.close();
+        \\    var buf: [256]u8 = undefined;
+        \\    const msg = std.fmt.bufPrint(&buf, "done:{d}:{d}:{d}", .{
+        \\        summary.total_requests,
+        \\        summary.total_errors,
+        \\        summary.p99_ns,
+        \\    }) catch return;
+        \\    file.writeAll(msg) catch return;
+        \\}
+    ;
+
+    const script_path = "/tmp/wrk3_test_done_script.zig";
+    const file = try std.fs.createFileAbsolute(script_path, .{});
+    try file.writeAll(script_content);
+    file.close();
+    defer std.fs.deleteFileAbsolute(script_path) catch {};
+
+    // Compile.
+    const so_path = ScriptLoader.compile(allocator, script_path) catch |err| {
+        std.debug.print("Compilation failed: {}\n", .{err});
+        return err;
+    };
+
+    // Load.
+    var loader = try ScriptLoader.load(allocator, so_path);
+    defer loader.deinit();
+    defer loader.cleanup();
+
+    // Verify done_fn resolved.
+    try testing.expect(loader.done_fn != null);
+
+    // Construct a summary with known values.
+    const summary = ScriptApi.Summary{
+        .total_requests = 42000,
+        .total_errors = 7,
+        .total_bytes_read = 0,
+        .total_bytes_written = 0,
+        .duration_ns = 0,
+        .avg_latency_ns = 0,
+        .max_latency_ns = 0,
+        .p50_ns = 0,
+        .p90_ns = 0,
+        .p99_ns = 4500000,
+        .p99_9_ns = 0,
+        .p99_99_ns = 0,
+    };
+
+    // Call done().
+    loader.done_fn.?(&summary);
+
+    // Read marker file and verify contents.
+    const marker = try std.fs.cwd().readFileAlloc(allocator, "/tmp/wrk3_test_done_marker.txt", 4096);
+    defer allocator.free(marker);
+    defer std.fs.deleteFileAbsolute("/tmp/wrk3_test_done_marker.txt") catch {};
+
+    try testing.expectEqualStrings("done:42000:7:4500000", marker);
+}
+
 test "ScriptLoader missing hooks are null" {
     const allocator = testing.allocator;
 

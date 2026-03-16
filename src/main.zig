@@ -139,8 +139,8 @@ pub fn main() !void {
     }
 
     // Print results.
-    try stats.formatReport(stdout, url_display, config.threads, config.connections, config.print_latency);
-    try stdout.flush();
+    stats.formatReport(stdout, url_display, config.threads, config.connections, config.print_latency) catch {};
+    stdout.flush() catch {};
 
     // Call done() script hook using an existing worker's loaded script.
     // Avoids extra dlopen/dlclose and ensures done() sees accumulated script state.
